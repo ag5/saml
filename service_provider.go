@@ -1475,8 +1475,9 @@ func (sp *ServiceProvider) nameIDFormat() string {
 
 // ValidateLogoutResponseRequest validates the LogoutResponse content from the request
 func (sp *ServiceProvider) ValidateLogoutResponseRequest(req *http.Request) error {
-	if data := req.URL.Query().Get("SAMLResponse"); data != "" {
-		return sp.ValidateLogoutResponseRedirect(data)
+	query := req.URL.Query()
+	if data := query.Get("SAMLResponse"); data != "" {
+		return sp.ValidateLogoutResponseRedirect(query)
 	}
 
 	err := req.ParseForm()
@@ -1528,8 +1529,8 @@ func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error
 //
 // URL Binding appears to be gzip / flate encoded
 // See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
-func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
-	resp, err := sp.ParseLogoutResponse(queryParameterData)
+func (sp *ServiceProvider) ValidateLogoutResponseRedirect(query url.Values) error {
+	resp, err := sp.ParseLogoutResponseRedirect(query)
 	if err != nil {
 		return err
 	}
@@ -1537,7 +1538,8 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	return sp.ValidateLogoutResponse(resp)
 }
 
-func (sp *ServiceProvider) ParseLogoutResponse(queryParameterData string) (*LogoutResponse, error) {
+func (sp *ServiceProvider) ParseLogoutResponseRedirect(query url.Values) (*LogoutResponse, error) {
+	queryParameterData := query.Get("SAMLResponse")
 	retErr := &InvalidResponseError{
 		Now: TimeNow(),
 	}
@@ -1559,6 +1561,15 @@ func (sp *ServiceProvider) ParseLogoutResponse(queryParameterData string) (*Logo
 		return nil, err
 	}
 
+	hasValidSignature := false
+	if query.Get("Signature") != "" && query.Get("SigAlg") != "" {
+		if err := sp.validateQuerySig(query); err != nil {
+			retErr.PrivateErr = err
+			return nil, retErr
+		}
+		hasValidSignature = true
+	}
+
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(gr); err != nil {
 		retErr.PrivateErr = err
@@ -1566,8 +1577,10 @@ func (sp *ServiceProvider) ParseLogoutResponse(queryParameterData string) (*Logo
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
-		retErr.PrivateErr = err
-		return retErr
+		if !errors.Is(err, errSignatureElementNotPresent) || !hasValidSignature {
+			retErr.PrivateErr = err
+			return nil, retErr
+		}
 	}
 
 	var resp LogoutResponse
