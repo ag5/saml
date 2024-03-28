@@ -1521,7 +1521,7 @@ func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error
 		retErr.PrivateErr = err
 		return retErr
 	}
-	return sp.validateLogoutResponse(&resp)
+	return sp.ValidateLogoutResponse(&resp)
 }
 
 // ValidateLogoutResponseRedirect returns a nil error if the logout response is valid.
@@ -1529,6 +1529,15 @@ func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error
 // URL Binding appears to be gzip / flate encoded
 // See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
 func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData string) error {
+	resp, err := sp.ParseLogoutResponse(queryParameterData)
+	if err != nil {
+		return err
+	}
+
+	return sp.ValidateLogoutResponse(resp)
+}
+
+func (sp *ServiceProvider) ParseLogoutResponse(queryParameterData string) (*LogoutResponse, error) {
 	retErr := &InvalidResponseError{
 		Now: TimeNow(),
 	}
@@ -1536,24 +1545,24 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	rawResponseBuf, err := base64.StdEncoding.DecodeString(queryParameterData)
 	if err != nil {
 		retErr.PrivateErr = fmt.Errorf("unable to parse base64: %s", err)
-		return retErr
+		return nil, retErr
 	}
 	retErr.Response = string(rawResponseBuf)
 
 	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
 	if err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
 
 	if err := xrv.Validate(bytes.NewReader(gr)); err != nil {
-		return err
+		return nil, err
 	}
 
 	doc := etree.NewDocument()
 	if err := doc.ReadFromBytes(gr); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
 
 	if err := sp.validateSignature(doc.Root()); err != nil {
@@ -1564,13 +1573,14 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(queryParameterData str
 	var resp LogoutResponse
 	if err := unmarshalElement(doc.Root(), &resp); err != nil {
 		retErr.PrivateErr = err
-		return retErr
+		return nil, retErr
 	}
-	return sp.validateLogoutResponse(&resp)
+
+	return &resp, nil
 }
 
-// validateLogoutResponse validates the LogoutResponse fields. Returns a nil error if the LogoutResponse is valid.
-func (sp *ServiceProvider) validateLogoutResponse(resp *LogoutResponse) error {
+// ValidateLogoutResponse validates the LogoutResponse fields. Returns a nil error if the LogoutResponse is valid.
+func (sp *ServiceProvider) ValidateLogoutResponse(resp *LogoutResponse) error {
 	if resp.Destination != sp.SloURL.String() {
 		return fmt.Errorf("`Destination` does not match SloURL (expected %q)", sp.SloURL.String())
 	}
