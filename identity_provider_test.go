@@ -125,6 +125,7 @@ func NewIdentityProviderTest(t *testing.T, opts ...idpTestOpts) *IdentityProvide
 		Logger:      logger.DefaultLogger,
 		MetadataURL: mustParseURL("https://idp.example.com/saml/metadata"),
 		SSOURL:      mustParseURL("https://idp.example.com/saml/sso"),
+		LogoutURL:   mustParseURL("https://idp.example.com/saml/slo"),
 		ServiceProviderProvider: &mockServiceProviderProvider{
 			GetServiceProviderFunc: func(r *http.Request, serviceProviderID string) (*EntityDescriptor, error) {
 				if serviceProviderID == test.SP.MetadataURL.String() {
@@ -210,6 +211,12 @@ func TestIDPCanProduceMetadata(t *testing.T) {
 						},
 					},
 					NameIDFormats: []NameIDFormat{NameIDFormat("urn:oasis:names:tc:SAML:2.0:nameid-format:transient")},
+					SingleLogoutServices: []Endpoint{
+						{
+							Binding:  HTTPRedirectBinding,
+							Location: "https://idp.example.com/saml/slo",
+						},
+					},
 				},
 				SingleSignOnServices: []Endpoint{
 					{
