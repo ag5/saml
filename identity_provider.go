@@ -2,6 +2,7 @@ package saml
 
 import (
 	"bytes"
+	"compress/flate"
 	"crypto"
 	"crypto/tls"
 	"crypto/x509"
@@ -195,6 +196,7 @@ func (idp *IdentityProvider) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(idp.MetadataURL.Path, idp.ServeMetadata)
 	mux.HandleFunc(idp.SSOURL.Path, idp.ServeSSO)
+	mux.HandleFunc(idp.LogoutURL.Path, idp.ServeLogout)
 	return mux
 }
 
@@ -256,6 +258,27 @@ func (idp *IdentityProvider) ServeSSO(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
+	if err := req.WriteResponse(w); err != nil {
+		idp.Logger.Printf("failed to write response: %s", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+}
+
+func (idp *IdentityProvider) ServeLogout(w http.ResponseWriter, r *http.Request) {
+	req, err := NewIdpLogoutRequest(idp, r)
+	if err != nil {
+		idp.Logger.Printf("failed to parse request: %s", err)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	if err := req.Validate(); err != nil {
+		idp.Logger.Printf("failed to validate request: %s", err)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
 	if err := req.WriteResponse(w); err != nil {
 		idp.Logger.Printf("failed to write response: %s", err)
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
@@ -335,6 +358,275 @@ func (idp *IdentityProvider) ServeIDPInitiated(w http.ResponseWriter, r *http.Re
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 		return
 	}
+}
+
+func (idp *IdentityProvider) signingContext() (*dsig.SigningContext, error) {
+	// Create a cert chain based off of the IDP cert and its intermediates.
+	certificates := [][]byte{idp.Certificate.Raw}
+	for _, cert := range idp.Intermediates {
+		certificates = append(certificates, cert.Raw)
+	}
+
+	var signingContext *dsig.SigningContext
+	var err error
+	// If signer is set, use it instead of the private key.
+	if idp.Signer != nil {
+		signingContext, err = dsig.NewSigningContext(idp.Signer, certificates)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		keyPair := tls.Certificate{
+			Certificate: certificates,
+			PrivateKey:  idp.Key,
+			Leaf:        idp.Certificate,
+		}
+		keyStore := dsig.TLSCertKeyStore(keyPair)
+
+		signingContext = dsig.NewDefaultSigningContext(keyStore)
+	}
+
+	// Default to using SHA1 if the signature method isn't set.
+	signatureMethod := idp.SignatureMethod
+	if signatureMethod == "" {
+		signatureMethod = dsig.RSASHA1SignatureMethod
+	}
+
+	signingContext.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList(canonicalizerPrefixList)
+	if err := signingContext.SetSignatureMethod(signatureMethod); err != nil {
+		return nil, err
+	}
+
+	return signingContext, nil
+}
+
+type IdpLogoutRequest struct {
+	IDP                     *IdentityProvider
+	HTTPRequest             *http.Request
+	RelayState              string
+	RequestBuffer           []byte
+	Request                 LogoutRequest
+	Now                     time.Time
+	ServiceProviderMetadata *EntityDescriptor
+
+	ResponseEl      *etree.Element
+	SPSSODescriptor *SPSSODescriptor
+	SLOEndpoint     *Endpoint
+}
+
+func (req *IdpLogoutRequest) Validate() error {
+	if err := xrv.Validate(bytes.NewReader(req.RequestBuffer)); err != nil {
+		return err
+	}
+
+	if err := xml.Unmarshal(req.RequestBuffer, &req.Request); err != nil {
+		return err
+	}
+
+	// We always have exactly one IDP SSO descriptor
+	if len(req.IDP.Metadata().IDPSSODescriptors) != 1 {
+		panic("expected exactly one IDP SSO descriptor in IDP metadata")
+	}
+	idpSsoDescriptor := req.IDP.Metadata().IDPSSODescriptors[0]
+
+	// In http://docs.oasis-open.org/security/saml/v2.0/saml-bindings-2.0-os.pdf §3.4.5.2
+	// we get a description of the Destination attribute:
+	//
+	//   If the message is signed, the Destination XML attribute in the root SAML
+	//   element of the protocol message MUST contain the URL to which the sender
+	//   has instructed the user agent to deliver the message. The recipient MUST
+	//   then verify that the value matches the location at which the message has
+	//   been received.
+	//
+	// We require the destination be correct either (a) if signing is enabled or
+	// (b) if it was provided.
+	mustHaveDestination := idpSsoDescriptor.WantAuthnRequestsSigned != nil && *idpSsoDescriptor.WantAuthnRequestsSigned
+	mustHaveDestination = mustHaveDestination || req.Request.Destination != ""
+	if mustHaveDestination {
+		if req.Request.Destination != req.IDP.LogoutURL.String() {
+			return fmt.Errorf("expected destination to be %q, not %q", req.IDP.SSOURL.String(), req.Request.Destination)
+		}
+	}
+
+	if req.Request.IssueInstant.Add(MaxIssueDelay).Before(req.Now) {
+		return fmt.Errorf("request expired at %s",
+			req.Request.IssueInstant.Add(MaxIssueDelay))
+	}
+	if req.Request.Version != "2.0" {
+		return fmt.Errorf("expected SAML request version 2.0 got %v", req.Request.Version)
+	}
+
+	// find the service provider
+	serviceProviderID := req.Request.Issuer.Value
+	serviceProvider, err := req.IDP.ServiceProviderProvider.GetServiceProvider(req.HTTPRequest, serviceProviderID)
+	if err == os.ErrNotExist {
+		return fmt.Errorf("cannot handle request from unknown service provider %s", serviceProviderID)
+	} else if err != nil {
+		return fmt.Errorf("cannot find service provider %s: %v", serviceProviderID, err)
+	}
+	req.ServiceProviderMetadata = serviceProvider
+
+	// Check that the ACS URL matches an ACS endpoint in the SP metadata.
+	if err := req.getSloEndpoint(); err != nil {
+		return fmt.Errorf("cannot find assertion consumer service: %v", err)
+	}
+
+	return nil
+}
+
+func (req *IdpLogoutRequest) WriteResponse(w http.ResponseWriter) error {
+	if req.ResponseEl == nil {
+		err := req.MakeResponse()
+		if err != nil {
+			return err
+		}
+	}
+
+	doc := etree.NewDocument()
+	doc.SetRoot(req.ResponseEl)
+	responseBuf, err := doc.WriteToBytes()
+	if err != nil {
+		return err
+	}
+
+	switch req.SLOEndpoint.Binding {
+	case HTTPRedirectBinding:
+		u, err := url.Parse(req.SLOEndpoint.ResponseLocation)
+		if err != nil {
+			return err
+		}
+
+		var buff = bytes.Buffer{}
+		w1 := base64.NewEncoder(base64.StdEncoding, &buff)
+		w2, _ := flate.NewWriter(w1, 9)
+		_, err = w2.Write(responseBuf)
+		if err != nil {
+			return err
+		}
+		err = w2.Close()
+		if err != nil {
+			return err
+		}
+		err = w1.Close()
+		if err != nil {
+			return err
+		}
+
+		q := u.Query()
+		q.Set("RelayState", req.RelayState)
+		q.Set("SAMLResponse", buff.String())
+		u.RawQuery = q.Encode()
+
+		http.Redirect(w, req.HTTPRequest, u.String(), http.StatusTemporaryRedirect)
+		return nil
+	default:
+		return fmt.Errorf("%s is not supported yet", req.SLOEndpoint.Binding)
+	}
+}
+
+func (req *IdpLogoutRequest) signingContext() (*dsig.SigningContext, error) {
+	return req.IDP.signingContext()
+}
+
+func (req *IdpLogoutRequest) MakeResponse() error {
+	response := LogoutResponse{
+		ID:           fmt.Sprintf("id-%x", randomBytes(20)),
+		InResponseTo: req.Request.ID,
+		IssueInstant: TimeNow(),
+		Version:      "2.0",
+		Issuer: &Issuer{
+			Format: "urn:oasis:names:tc:SAML:2.0:nameid-format:entity",
+			Value:  req.IDP.Metadata().EntityID,
+		},
+		Destination: req.SLOEndpoint.ResponseLocation,
+		Status: Status{
+			StatusCode: StatusCode{
+				Value: StatusSuccess,
+			},
+		},
+	}
+
+	responseEl := response.Element()
+
+	// Sign the response element (we've already signed the Assertion element)
+	{
+		signingContext, err := req.signingContext()
+		if err != nil {
+			return err
+		}
+
+		signedResponseEl, err := signingContext.SignEnveloped(responseEl)
+		if err != nil {
+			return err
+		}
+
+		sigEl := signedResponseEl.ChildElements()[len(signedResponseEl.ChildElements())-1]
+		response.Signature = sigEl
+		responseEl = response.Element()
+	}
+
+	req.ResponseEl = responseEl
+	return nil
+}
+
+func (req *IdpLogoutRequest) getSloEndpoint() error {
+	// if we can't find a default, use *any* ACS binding
+	for _, spssoDescriptor := range req.ServiceProviderMetadata.SPSSODescriptors {
+		for _, spLogoutConsumerService := range spssoDescriptor.SingleLogoutServices {
+			switch spLogoutConsumerService.Binding {
+			case HTTPPostBinding, HTTPRedirectBinding:
+				// explicitly copy loop iterator variables
+				//
+				// c.f. https://github.com/golang/go/wiki/CommonMistakes#using-reference-to-loop-iterator-variable
+				//
+				// (note that I'm pretty sure this isn't strictly necessary because we break out of the loop immediately,
+				// but it certainly doesn't hurt anything and may prevent bugs in the future.)
+				spssoDescriptor, spLogoutConsumerService := spssoDescriptor, spLogoutConsumerService
+
+				req.SPSSODescriptor = &spssoDescriptor
+				req.SLOEndpoint = &spLogoutConsumerService
+				return nil
+			}
+		}
+	}
+
+	return os.ErrNotExist // no ACS url found or specified
+
+}
+
+func NewIdpLogoutRequest(idp *IdentityProvider, r *http.Request) (*IdpLogoutRequest, error) {
+	req := &IdpLogoutRequest{
+		IDP:         idp,
+		HTTPRequest: r,
+		Now:         TimeNow(),
+	}
+
+	switch r.Method {
+	case "GET":
+		compressedRequest, err := base64.StdEncoding.DecodeString(r.URL.Query().Get("SAMLRequest"))
+		if err != nil {
+			return nil, fmt.Errorf("cannot decode request: %s", err)
+		}
+		req.RequestBuffer, err = io.ReadAll(newSaferFlateReader(bytes.NewReader(compressedRequest)))
+		if err != nil {
+			return nil, fmt.Errorf("cannot decompress request: %s", err)
+		}
+		req.RelayState = r.URL.Query().Get("RelayState")
+	case "POST":
+		if err := r.ParseForm(); err != nil {
+			return nil, err
+		}
+		var err error
+		req.RequestBuffer, err = base64.StdEncoding.DecodeString(r.PostForm.Get("SAMLRequest"))
+		if err != nil {
+			return nil, err
+		}
+		req.RelayState = r.PostForm.Get("RelayState")
+	default:
+		return nil, fmt.Errorf("method not allowed")
+	}
+
+	return req, nil
 }
 
 // IdpAuthnRequest is used by IdentityProvider to handle a single authentication request.
@@ -1083,41 +1375,5 @@ func (req *IdpAuthnRequest) MakeResponse() error {
 
 // signingContext will create a signing context for the request.
 func (req *IdpAuthnRequest) signingContext() (*dsig.SigningContext, error) {
-	// Create a cert chain based off of the IDP cert and its intermediates.
-	certificates := [][]byte{req.IDP.Certificate.Raw}
-	for _, cert := range req.IDP.Intermediates {
-		certificates = append(certificates, cert.Raw)
-	}
-
-	var signingContext *dsig.SigningContext
-	var err error
-	// If signer is set, use it instead of the private key.
-	if req.IDP.Signer != nil {
-		signingContext, err = dsig.NewSigningContext(req.IDP.Signer, certificates)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		keyPair := tls.Certificate{
-			Certificate: certificates,
-			PrivateKey:  req.IDP.Key,
-			Leaf:        req.IDP.Certificate,
-		}
-		keyStore := dsig.TLSCertKeyStore(keyPair)
-
-		signingContext = dsig.NewDefaultSigningContext(keyStore)
-	}
-
-	// Default to using SHA1 if the signature method isn't set.
-	signatureMethod := req.IDP.SignatureMethod
-	if signatureMethod == "" {
-		signatureMethod = dsig.RSASHA1SignatureMethod
-	}
-
-	signingContext.Canonicalizer = dsig.MakeC14N10ExclusiveCanonicalizerWithPrefixList(canonicalizerPrefixList)
-	if err := signingContext.SetSignatureMethod(signatureMethod); err != nil {
-		return nil, err
-	}
-
-	return signingContext, nil
+	return req.IDP.signingContext()
 }

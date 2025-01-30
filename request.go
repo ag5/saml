@@ -24,6 +24,9 @@ func EntityIDFromRequest(r *http.Request) (string, error) {
 	}
 
 	gr, err := io.ReadAll(newSaferFlateReader(bytes.NewBuffer(rawResponseBuf)))
+	if err != nil {
+		return "", err
+	}
 
 	if err = xrv.Validate(bytes.NewReader(gr)); err != nil {
 		return "", err
