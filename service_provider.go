@@ -1477,7 +1477,7 @@ func (sp *ServiceProvider) nameIDFormat() string {
 func (sp *ServiceProvider) ValidateLogoutResponseRequest(req *http.Request) error {
 	query := req.URL.Query()
 	if data := query.Get("SAMLResponse"); data != "" {
-		return sp.ValidateLogoutResponseRedirect(query)
+		return sp.ValidateLogoutResponseRedirect(req.URL.RawQuery)
 	}
 
 	err := req.ParseForm()
@@ -1529,7 +1529,7 @@ func (sp *ServiceProvider) ValidateLogoutResponseForm(postFormData string) error
 //
 // URL Binding appears to be gzip / flate encoded
 // See https://www.oasis-open.org/committees/download.php/20645/sstc-saml-tech-overview-2%200-draft-10.pdf  6.6
-func (sp *ServiceProvider) ValidateLogoutResponseRedirect(query url.Values) error {
+func (sp *ServiceProvider) ValidateLogoutResponseRedirect(query string) error {
 	resp, err := sp.ParseLogoutResponseRedirect(query)
 	if err != nil {
 		return err
@@ -1538,8 +1538,13 @@ func (sp *ServiceProvider) ValidateLogoutResponseRedirect(query url.Values) erro
 	return sp.ValidateLogoutResponse(resp)
 }
 
-func (sp *ServiceProvider) ParseLogoutResponseRedirect(query url.Values) (*LogoutResponse, error) {
-	queryParameterData := query.Get("SAMLResponse")
+func (sp *ServiceProvider) ParseLogoutResponseRedirect(query string) (*LogoutResponse, error) {
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return nil, fmt.Errorf("parsing query string: %w", err)
+	}
+
+	queryParameterData := values.Get("SAMLResponse")
 	retErr := &InvalidResponseError{
 		Now: TimeNow(),
 	}
@@ -1562,7 +1567,7 @@ func (sp *ServiceProvider) ParseLogoutResponseRedirect(query url.Values) (*Logou
 	}
 
 	hasValidSignature := false
-	if query.Get("Signature") != "" && query.Get("SigAlg") != "" {
+	if values.Get("Signature") != "" && values.Get("SigAlg") != "" {
 		if err := sp.validateQuerySig(query); err != nil {
 			retErr.PrivateErr = err
 			return nil, retErr

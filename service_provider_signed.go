@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 
 	dsig "github.com/russellhaering/goxmldsig"
 )
@@ -61,9 +62,14 @@ func (sp *ServiceProvider) signQuery(reqT reqType, query, body, relayState strin
 
 // validateSig validation of the signature of the Redirect Binding in query values
 // Query is valid if return is nil
-func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
-	sig := query.Get("Signature")
-	alg := query.Get("SigAlg")
+func (sp *ServiceProvider) validateQuerySig(query string) error {
+	values, err := url.ParseQuery(query)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrInvalidQuerySignature, err)
+	}
+
+	sig := values.Get("Signature")
+	alg := values.Get("SigAlg")
 	if sig == "" || alg == "" {
 		return ErrNoQuerySignature
 	}
@@ -72,27 +78,24 @@ func (sp *ServiceProvider) validateQuerySig(query url.Values) error {
 	if err != nil {
 		return err
 	}
-
-	respType := ""
-	if query.Get("SAMLResponse") != "" {
-		respType = "SAMLResponse"
-	} else if query.Get("SAMLRequest") != "" {
-		respType = "SAMLRequest"
-	} else {
+	
+	if values.Get("SAMLResponse") == "" && values.Get("SAMLRequest") == "" {
 		return fmt.Errorf("No SAMLResponse or SAMLRequest found in query")
 	}
 
-	// Encode Query as standard demands.
-	// query.Encode() is not standard compliant
-	// as query encoding order matters
-	res := respType + "=" + url.QueryEscape(query.Get(respType))
+	parts := strings.Split(query, "&")
+	res := ""
 
-	relayState := query.Get("RelayState")
-	if relayState != "" {
-		res += "&RelayState=" + url.QueryEscape(relayState)
+	for _, k := range []string{"SAMLResponse", "SAMLRequest", "RelayState", "SigAlg"} {
+		for _, p := range parts {
+			if strings.HasPrefix(p, k+"=") {
+				if len(res) > 0 {
+					res += "&"
+				}
+				res += p
+			}
+		}
 	}
-
-	res += "&SigAlg=" + url.QueryEscape(alg)
 
 	// Signature is base64 encoded
 	sigBytes, err := base64.StdEncoding.DecodeString(sig)
